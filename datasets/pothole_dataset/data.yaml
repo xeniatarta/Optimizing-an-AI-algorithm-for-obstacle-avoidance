@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['pothole']
+
+roboflow:
+  workspace: yeeun-kim-fyvoj
+  project: pothole-vhmow
+  version: 18
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/yeeun-kim-fyvoj/pothole-vhmow/dataset/18
