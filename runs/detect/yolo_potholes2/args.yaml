@@ -11,7 +11,7 @@ save: true
 save_period: -1
 cache: false
 device: '0'
-workers: 8
+workers: 0
 project: null
 name: yolo_potholes2
 exist_ok: false
@@ -103,4 +103,4 @@ auto_augment: randaugment
 erasing: 0.4
 cfg: null
 tracker: botsort.yaml
-save_dir: C:\Users\xenia\Desktop\YoloObstacle\runs\detect\yolo_potholes2
+save_dir: E:\Facultate\An_3\Semestru_1\SSC\Proiect\YoloObstacle\runs\detect\yolo_potholes2

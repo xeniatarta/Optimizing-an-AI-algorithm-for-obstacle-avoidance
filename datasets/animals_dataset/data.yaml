@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 6
+names: ['cat', 'chicken', 'cow', 'dog', 'horse', 'sheep']
+
+roboflow:
+  workspace: python-project-dg3jy
+  project: animals-tkh0d
+  version: 2
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/python-project-dg3jy/animals-tkh0d/dataset/2
