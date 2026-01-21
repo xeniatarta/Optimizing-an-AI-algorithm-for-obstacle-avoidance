@@ -6,32 +6,94 @@ import glob
 import os
 import time
 import numpy as np
+from threading import Thread
+import queue
 
 # --- CONFIGURARE ---
 INPUT_FOLDER = "images_in"
 OUTPUT_FOLDER = "images_out"
-# Calea de baza (fara extensie) - scriptul cauta singur .engine, .onnx, .pt
-POTHOLE_MODEL_PATH = "runs/detect/yolo_potholes3/weights/best"
+
+# MODEL UNIFICAT
+MODEL_PATH = "runs/detect/yolo_unified2/weights/best" 
 
 VISUALIZE = True
-SAVE_OUTPUT = True
+SAVE_OUTPUT = False 
 
-# Controler PD (Pentru stabilitatea directiei calculate)
+# Controler PD
 KP = 1.0
 KD = 0.6
 last_raw_steering = 0.0
 
-# 1. Verificam structura de foldere
-if not os.path.exists(INPUT_FOLDER):
-    print(f" EROARE: Folderul '{INPUT_FOLDER}' nu exista! Creeaza-l langa main.py.")
-    exit()
+# --- CLASA 1: CITIRE RAPIDA ---
+class ThreadedImageLoader:
+    def __init__(self, file_list, queue_size=4):
+        self.file_list = file_list
+        self.q = queue.Queue(maxsize=queue_size)
+        self.stopped = False
+        self.thread = Thread(target=self.update, args=())
+        self.thread.daemon = True
 
+    def start(self):
+        self.thread.start()
+        return self
+
+    def update(self):
+        for img_path in self.file_list:
+            if self.stopped: break
+            frame = cv2.imread(img_path)
+            if frame is not None:
+                self.q.put((img_path, frame))
+        self.stopped = True
+        self.q.put(None)
+
+    def read(self):
+        return self.q.get()
+
+    def stop(self):
+        self.stopped = True
+
+# --- CLASA 2: SCRIERE RAPIDA ---
+class ThreadedImageWriter:
+    def __init__(self, queue_size=10):
+        self.q = queue.Queue(maxsize=queue_size)
+        self.stopped = False
+        self.thread = Thread(target=self.update, args=())
+        self.thread.daemon = True
+
+    def start(self):
+        self.thread.start()
+        return self
+
+    def save(self, frame, path):
+        if self.stopped: return
+        try:
+            self.q.put_nowait((frame.copy(), path))
+        except queue.Full:
+            pass 
+
+    def update(self):
+        while not self.stopped:
+            try:
+                data = self.q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            frame, path = data
+            cv2.imwrite(path, frame)
+            self.q.task_done()
+
+    def stop(self):
+        self.stopped = True
+        self.thread.join()
+
+# Verificari foldere
+if not os.path.exists(INPUT_FOLDER):
+    print(f" EROARE: Folderul '{INPUT_FOLDER}' nu exista!")
+    exit()
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 print(f"CUDA Disponibil: {torch.cuda.is_available()}")
 
-# --- 2. COMPILARE CUDA (JIT) ---
+# --- 2. COMPILARE CUDA ---
 print(">>> Compilez algoritmul CUDA...")
-t_compile_start = time.time()
 try:
     avoidance_cuda = load(
         name="avoidance_cuda",
@@ -40,88 +102,60 @@ try:
         extra_cuda_cflags=['-allow-unsupported-compiler', '-O3', '--use_fast_math'],
         verbose=False
     )
-    t_compile_end = time.time()
-    print(f"✅ Compilare reusita! (Timp: {t_compile_end - t_compile_start:.2f} secunde)")
+    print("✅ Compilare reusita!")
 except Exception as e:
     print(f"❌ EROARE COMPILARE: {e}")
-    print("SFAT: Verifica daca ai instalat Visual Studio si CUDA Toolkit corect.")
     exit()
 
-
-# --- 3. FUNCTII LOGICA & VIZUALIZARE ---
-
+# --- 3. LOGICA ---
 def check_center_path(boxes, img_w, img_h):
-    """
-    Verifica daca tunelul central din fata masinii este liber.
-    Returneaza: (is_clear, lane_left_x, lane_right_x)
-    """
-    # Presupunem ca masina ocupa 35% din latimea imaginii la baza
     car_width = img_w * 0.35 
     lane_left = int((img_w - car_width) // 2)
     lane_right = int((img_w + car_width) // 2)
-    
-    # Ne uitam pana la 50% din inaltime (nu ne intereseaza obstacolele de la orizont indepartat)
     look_ahead_y = img_h * 0.5 
-
     is_clear = True
-    
     for box in boxes:
         x1, y1, x2, y2 = map(int, box)
-        
-        # Ignoram obstacolele care sunt prea sus (prea departe)
-        if y2 < look_ahead_y:
-            continue
-
-        # Verificam intersectia pe orizontala
-        # Daca dreptunghiul obstacolului se suprapune cu banda noastra
+        if y2 < look_ahead_y: continue
         if (x2 > lane_left) and (x1 < lane_right):
             is_clear = False
             break
-            
     return is_clear, lane_left, lane_right
 
 def draw_car_tracks(img, steering, obstacle_box=None, is_straight=True):
+    """ Deseneaza sinele rotilor cu perspectiva 3D (Subtire si Precis). """
     h, w = img.shape[:2]
     
-    # --- CONFIGURARE PERSPECTIVA (Sincronizat cu CUDA) ---
-    # Aceste valori trebuie sa reflecte ce am pus in avoidance_kernel.cu
-    # CAR_TOTAL_WIDTH era 0.45 (45%)
-    # TIRE_WIDTH era 0.12 (12%)
-    
+    # Sincronizare cu CUDA (procente din latime)
     car_total_w_bottom = int(w * 0.45)   
     tire_w_bottom = int(w * 0.12)
-    
-    # La orizont, totul e mai mic (efect 3D)
     car_total_w_horizon = int(w * 0.10)
     tire_w_horizon = int(w * 0.03)
     
     start_pt = np.array([w // 2, h])
-    
-    # Generare puncte centrale (Coloana vertebrala)
     center_points = []
     num_points = 40
     
+    # --- 1. GENERARE TRAIECTORIE CENTRALA ---
     if is_straight:
-        end_x = w // 2 + int(steering * 150) # Sensibilitate vizuala
+        # Linie dreapta simpla
+        end_x = w // 2 + int(steering * 150)
         end_y = int(h * 0.4)
-        
         for t in np.linspace(0, 1, num_points):
             x = int((1 - t) * start_pt[0] + t * end_x)
             y = int((1 - t) * start_pt[1] + t * end_y)
             center_points.append([x, y])
         color_tracks = (0, 255, 0) # Verde
     else:
-        # Logica curba (Bezier) ramane similara, dar mai fina
+        # Logica curba (Bezier) pentru ocolire lina
         if obstacle_box is not None:
             ox1, oy1, ox2, oy2 = map(int, obstacle_box)
             obs_center_y = int((oy1 + oy2) / 2)
             direction = np.sign(steering) if abs(steering) > 0.01 else 1
             
-            # Apex calculation
+            # Calculam punctul de ocolire (Apex)
             dist_factor = (h - obs_center_y) / h
             current_car_w = car_total_w_horizon + (car_total_w_bottom - car_total_w_horizon) * dist_factor
-            
-            # Ocolim la limita (jumatate de masina + marja mica)
             safety_offset = int(current_car_w / 2) + 20 
             
             if direction > 0: apex_x = min(w - 20, ox2 + safety_offset)
@@ -132,6 +166,7 @@ def draw_car_tracks(img, steering, obstacle_box=None, is_straight=True):
             p2 = np.array([apex_x, obs_center_y])
             p3 = np.array([w // 2, int(h * 0.35)])
 
+            # Interpolare Bezier
             for t in np.linspace(0, 1, num_points):
                 if t < 0.5:
                     tt = t * 2
@@ -144,204 +179,166 @@ def draw_car_tracks(img, steering, obstacle_box=None, is_straight=True):
                     q1 = (1-tt)*p3 + tt*p3
                     pt = (1-tt)*q0 + tt*q1
                 center_points.append(pt.astype(int))
+        else:
+            # Fallback (Curba lina fara obstacol specific) - REPARATIA E AICI
+            end_x = w // 2 + int(steering * 200)
+            end_y = int(h * 0.4)
+            # Folosim o curba patratica simpla
+            ctrl_x = w // 2 + int(steering * 100)
+            ctrl_y = int(h * 0.7)
+            
+            p0 = start_pt
+            p1 = np.array([ctrl_x, ctrl_y])
+            p2 = np.array([end_x, end_y])
+            
+            for t in np.linspace(0, 1, num_points):
+                pt = (1-t)**2 * p0 + 2*(1-t)*t * p1 + t**2 * p2
+                center_points.append(pt.astype(int))
+
         color_tracks = (0, 255, 255) # Galben
 
-    # --- DESENARE SINE ROTI (Linii Fine) ---
-    left_track_inner = []
-    left_track_outer = []
-    right_track_inner = []
-    right_track_outer = []
+    # --- 2. DESENARE SINE ROTI (Linii Fine) ---
+    left_track = []
+    right_track = []
     
-    for i, pt in enumerate(center_points):
-        t = i / (num_points - 1)
-        
-        # Interpolare latimi
-        current_total_w = car_total_w_bottom * (1-t) + car_total_w_horizon * t
-        current_tire_w = tire_w_bottom * (1-t) + tire_w_horizon * t
-        
-        half_w = current_total_w / 2
-        
-        # Coordonate X pentru roti
-        lx_center = pt[0] - half_w + (current_tire_w / 2)
-        rx_center = pt[0] + half_w - (current_tire_w / 2)
-        
-        # Putem desena conturul rotii sau doar o linie subtire pe mijlocul ei
-        # Aici desenam o linie care reprezinta centrul anvelopei
-        left_track_inner.append([int(lx_center), pt[1]])
-        right_track_inner.append([int(rx_center), pt[1]])
+    if len(center_points) > 0:
+        for i, pt in enumerate(center_points):
+            t = i / (num_points - 1)
+            
+            # Interpolare perspectiva pentru latimea masinii
+            current_total_w = car_total_w_bottom * (1-t) + car_total_w_horizon * t
+            current_tire_w = tire_w_bottom * (1-t) + tire_w_horizon * t
+            
+            half_w = current_total_w / 2
+            
+            # Coordonate X pentru roti
+            lx = pt[0] - half_w + (current_tire_w / 2)
+            rx = pt[0] + half_w - (current_tire_w / 2)
+            
+            left_track.append([int(lx), pt[1]])
+            right_track.append([int(rx), pt[1]])
 
-    # Desenam cu thickness=2 (subtire)
-    pts_l = np.array(left_track_inner, np.int32).reshape((-1, 1, 2))
-    pts_r = np.array(right_track_inner, np.int32).reshape((-1, 1, 2))
-    
-    cv2.polylines(img, [pts_l], False, color_tracks, 2, cv2.LINE_AA)
-    cv2.polylines(img, [pts_r], False, color_tracks, 2, cv2.LINE_AA)
-    
-    # Traverse (Traversele sunt utile pentru perceptia adancimii)
-    for i in range(0, num_points, 5):
-        cv2.line(img, tuple(left_track_inner[i]), tuple(right_track_inner[i]), color_tracks, 1, cv2.LINE_AA)
+        pts_l = np.array(left_track, np.int32).reshape((-1, 1, 2))
+        pts_r = np.array(right_track, np.int32).reshape((-1, 1, 2))
+        
+        cv2.polylines(img, [pts_l], False, color_tracks, 2, cv2.LINE_AA)
+        cv2.polylines(img, [pts_r], False, color_tracks, 2, cv2.LINE_AA)
+        
+        # Traverse
+        for i in range(0, num_points, 5):
+             if i < len(left_track) and i < len(right_track):
+                cv2.line(img, tuple(left_track[i]), tuple(right_track[i]), color_tracks, 1, cv2.LINE_AA)
 
-    status_text = "STRADDLE (CENTRU)" if (is_straight and obstacle_box is not None) else ("LIBER" if is_straight else "OCOLIRE")
-    cv2.putText(img, status_text, (w//2 - 80, h - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_tracks, 2)
+    status_text = "STRADDLE" if (is_straight and obstacle_box is not None) else ("LIBER" if is_straight else "OCOLIRE")
+    cv2.putText(img, status_text, (w//2 - 60, h - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_tracks, 2)
 
-
-# --- 4. SELECTOR MODELE (Engine > ONNX > PT) ---
+# --- 4. INCARCARE MODEL ---
 def load_optimized_model(path_prefix, task='detect'):
     if os.path.exists(path_prefix + ".engine"):
-        print(f"🚀 Incarc Engine (Viteza Maxima): {path_prefix}.engine")
+        print(f"🚀 Engine: {path_prefix}.engine")
         return YOLO(path_prefix + ".engine", task=task)
-    elif os.path.exists(path_prefix + ".onnx"):
-        print(f"🚄 Incarc ONNX: {path_prefix}.onnx")
-        return YOLO(path_prefix + ".onnx", task=task)
     elif os.path.exists(path_prefix + ".pt"):
-        print(f"⚠️ Incarc PT: {path_prefix}.pt")
+        print(f"⚠️ PT: {path_prefix}.pt")
         return YOLO(path_prefix + ".pt")
     return None
 
-# --- MAIN: INCARCARE SI PROCESARE ---
+print("\n>>> Incarc Modelul Unificat...")
+model = load_optimized_model(MODEL_PATH)
+if model is None: model = YOLO("yolov8n.pt")
+print("✅ Model incarcat.")
 
-print("\n>>> Incarc Modelele AI...")
-# Modelul standard (masini)
-model_cars = load_optimized_model("runs/detect/yolo_animals/weights/best") 
-if model_cars is None: model_cars = YOLO("yolov8n.pt")
+# --- 5. PROCESARE ---
+image_files = glob.glob(os.path.join(INPUT_FOLDER, "*.*"))
+print(f"\n>>> Procesez {len(image_files)} imagini.")
 
-# Modelul gropi
-model_potholes = load_optimized_model(POTHOLE_MODEL_PATH)
-print("Modele incarcate.")
+loader = ThreadedImageLoader(image_files).start()
+writer = ThreadedImageWriter().start() 
 
-# Cautam imagini
-extensions = ["*.jpg", "*.jpeg", "*.png", "*.bmp"]
-image_files = []
-for ext in extensions:
-    image_files.extend(glob.glob(os.path.join(INPUT_FOLDER, ext)))
+i = 0
+last_vis_time = 0
+VIS_INTERVAL = 0.033 
 
-print(f"\n>>> Am gasit {len(image_files)} imagini.")
-
-if len(image_files) == 0:
-    print("⚠️ Nu am gasit imagini! Pune poze in folderul 'images_in'.")
-    exit()
-
-for i, img_path in enumerate(image_files):
-    t_start_frame = time.time()
-
-    # 1. LOAD IMAGE
-    t_load_start = time.time()
-    frame = cv2.imread(img_path)
-    t_load_end = time.time()
-
+while True:
+    data = loader.read()
+    if data is None: break
+    img_path, frame = data
     if frame is None: continue
-    h, w, _ = frame.shape
-
-    # 2. INFERENTA (ZERO-COPY: Datele raman pe GPU!)
-    t_infer_start = time.time()
     
-    gpu_boxes_list = [] # Aici adunam rezultatele de la ambele modele
+    t_start = time.time()
+    h, w = frame.shape[:2]
 
-    # Vehicule
-    res_cars = model_cars(frame, verbose=False, classes=[2, 5, 7])
-    if res_cars[0].boxes.shape[0] > 0:
-        gpu_boxes_list.append(res_cars[0].boxes.xyxy) # Pastram pe GPU
+    # 1. INFERENTA
+    gpu_boxes_list = [] 
+    if model:
+        # half=True e OK aici
+        res = model(frame, verbose=False, conf=0.40, imgsz=640, half=True)
+        if res[0].boxes.shape[0] > 0:
+            gpu_boxes_list.append(res[0].boxes.xyxy)
 
-    # Gropi
-    if model_potholes:
-        res_holes = model_potholes(frame, verbose=False, conf=0.25)
-        if res_holes[0].boxes.shape[0] > 0:
-            gpu_boxes_list.append(res_holes[0].boxes.xyxy) # Pastram pe GPU
-    
-    t_infer_end = time.time()
-
-    # 3. LOGICA (Concatenare + Kernel pe GPU)
-    t_logic_start = time.time()
-
-    # Concatenare instanta pe VRAM
+    # 2. CUDA
     if len(gpu_boxes_list) > 0:
         final_boxes_gpu = torch.cat(gpu_boxes_list, dim=0)
+        # REPARATIE CRITICA: Convertim la FLOAT32 pentru C++
+        final_boxes_gpu = final_boxes_gpu.float() 
     else:
         final_boxes_gpu = torch.empty((0, 4), device='cuda')
 
-    # Trimitem direct tensorul GPU la kernelul C++ pentru calculul fortei
     raw_steering = 0.0
     if final_boxes_gpu.shape[0] > 0:
-        if final_boxes_gpu.device.type != 'cuda': 
-            final_boxes_gpu = final_boxes_gpu.cuda()
-            
+        if final_boxes_gpu.device.type != 'cuda': final_boxes_gpu = final_boxes_gpu.cuda()
         raw_steering = avoidance_cuda.compute_steering(final_boxes_gpu, float(w))
 
-    # Controler PD pentru netezire
     p_term = raw_steering * KP
     d_term = (raw_steering - last_raw_steering) * KD
     final_steering = p_term + d_term
     last_raw_steering = raw_steering
-
-    t_logic_end = time.time()
-
-    # 4. VIZUALIZARE & SALVARE (Aici mutam pe CPU - Partea Lenta, doar pt oameni)
-    t_vis_start = time.time()
-
-    if VISUALIZE and SAVE_OUTPUT:
+    
+    # 3. VIZUALIZARE
+    should_show = VISUALIZE and (time.time() - last_vis_time > VIS_INTERVAL)
+    
+    if SAVE_OUTPUT or should_show:
         cpu_boxes = []
         if final_boxes_gpu.shape[0] > 0:
-            cpu_boxes = final_boxes_gpu.cpu().numpy()
-            
-            # A. VERIFICARE CULOAR (GAP DETECTION)
-            is_path_clear, l_left, l_right = check_center_path(cpu_boxes, w, h)
-
-            # B. IDENTIFICARE OBSTACOL CRITIC SI DESENARE PATRATE
-            closest_obstacle_box = None
-            max_y2 = -1
-            
-            for box in cpu_boxes:
-                x1, y1, x2, y2 = map(int, box)
-                
-                # Definim zona masinii
-                car_center_x = w // 2
-                lane_half_w = (w * 0.35) // 2
-                
-                # Verificam daca obstacolul blocheaza fizic masina
-                is_blocking = (x2 > car_center_x - lane_half_w) and \
-                              (x1 < car_center_x + lane_half_w) and \
-                              (y2 > h * 0.4)
-                
-                if not is_path_clear and is_blocking:
-                    color = (0, 0, 255) # ROSU = Pericol Iminent
-                    # Acesta este obstacolul pe care trebuie sa-l ocolim
-                    if y2 > max_y2:
-                        max_y2 = y2
-                        closest_obstacle_box = box
-                else:
-                    color = (0, 255, 0) # VERDE = Obstacol, dar nu blocheaza
-
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-            # C. DESENARE SINE ROTI
-            if is_path_clear:
-                # Cazul: Gropi stanga/dreapta (Poza 2), dar tunel liber -> Mergem DREPT
-                draw_car_tracks(frame, 0.0, is_straight=True)
-            else:
-                # Cazul: Obstacol pe mijloc (Poza 1) -> OCOLIM
-                # Daca nu am gasit un obstacol specific, folosim doar steering-ul general
-                draw_car_tracks(frame, final_steering, obstacle_box=closest_obstacle_box, is_straight=False)
-
+             cpu_boxes = final_boxes_gpu.cpu().numpy()
+             is_clear, _, _ = check_center_path(cpu_boxes, w, h)
+             
+             closest_obstacle_box = None
+             max_y2 = -1
+             for box in cpu_boxes:
+                 x1, y1, x2, y2 = map(int, box)
+                 lane_center = w // 2
+                 lane_width_px = w * 0.35
+                 is_blocking = (x2 > lane_center - lane_width_px/2) and \
+                               (x1 < lane_center + lane_width_px/2) and \
+                               (y2 > h * 0.4)
+                 
+                 color = (0, 0, 255) if (not is_clear and is_blocking) else (0, 255, 0)
+                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                 
+                 if not is_clear and is_blocking and y2 > max_y2:
+                    max_y2 = y2
+                    closest_obstacle_box = box
+             
+             draw_car_tracks(frame, final_steering, obstacle_box=closest_obstacle_box, is_straight=is_clear)
         else:
-            # Niciun obstacol detectat -> Mergem DREPT
-            draw_car_tracks(frame, 0.0, is_straight=True)
+             draw_car_tracks(frame, 0.0, is_straight=True)
 
-        # Salvare
-        save_path = os.path.join(OUTPUT_FOLDER, "result_" + os.path.basename(img_path))
-        cv2.imwrite(save_path, frame)
+        if SAVE_OUTPUT:
+            save_path = os.path.join(OUTPUT_FOLDER, "res_" + os.path.basename(img_path))
+            writer.save(frame, save_path) 
 
-    t_vis_end = time.time()
-    t_end_frame = time.time()
+        if should_show:
+            fps_disp = 1.0 / (time.time() - t_start)
+            cv2.putText(frame, f"FPS: {fps_disp:.0f}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            cv2.imshow("Preview", frame)
+            cv2.waitKey(1)
+            last_vis_time = time.time()
 
-    # CALCUL TIMPI
-    time_load = (t_load_end - t_load_start) * 1000
-    time_infer = (t_infer_end - t_infer_start) * 1000
-    time_logic = (t_logic_end - t_logic_start) * 1000
-    time_vis = (t_vis_end - t_vis_start) * 1000
-    fps = 1.0 / (t_end_frame - t_start_frame)
+    fps = 1.0 / (time.time() - t_start)
+    print(f"Img {i} | FPS: {fps:.1f} | Steer: {final_steering:.2f}")
+    i += 1
 
-    print(f"Img {i} | Steer: {final_steering:.2f} | FPS: {fps:.1f} || "
-          f"Load: {time_load:.1f}ms | Infer: {time_infer:.1f}ms | "
-          f"Logic: {time_logic:.1f}ms | Vis/Save: {time_vis:.1f}ms")
-
-print("\n✅ Procesare completa.")
+loader.stop()
+writer.stop() 
+cv2.destroyAllWindows()
+print("\n✅ Gata.")

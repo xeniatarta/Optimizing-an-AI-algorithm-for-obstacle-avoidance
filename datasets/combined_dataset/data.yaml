@@ -1,0 +1,8 @@
+names:
+- pothole
+- obstacle
+- animal
+nc: 3
+path: E:\Facultate\An_3\Semestru_1\SSC\Proiect\YoloObstacle\datasets\combined_dataset
+train: train/images
+val: valid/images
