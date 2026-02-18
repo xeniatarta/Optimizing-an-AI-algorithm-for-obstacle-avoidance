@@ -1,0 +1,31 @@
+# Binaries and executables
+*.exe
+*.dll
+*.so
+*.dylib
+*.out
+*.app
+
+# C++ / Visual Studio / VS Code
+*.obj
+*.pdb
+*.ilk
+*.suo
+.vs/
+.vscode/
+build/
+bin/
+x64/
+Debug/
+Release/
+
+# Python / AI (pentru Yolo)
+__pycache__/
+*.pyc
+.venv/
+env/
+.env
+
+# OS
+.DS_Store
+Thumbs.db
